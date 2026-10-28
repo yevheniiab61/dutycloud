@@ -1,0 +1,100 @@
+name: dutycloud
+
+services:
+  # ---------- Edge / API Gateway + Discovery + Load Balancer ----------
+  gateway:
+    image: traefik:v3.6
+    command:
+      - --api.insecure=true                       # дашборд на :8080
+      - --providers.docker=true                   # автоматичне виявлення контейнерів (discovery)
+      - --providers.docker.exposedbydefault=false # публікуємо лише сервіси з traefik.enable=true
+      - --providers.docker.network=dutycloud-net
+      - --entrypoints.web.address=:80
+    ports:
+      - "8000:80"   # єдина точка входу для клієнтів
+      - "8080:8080" # дашборд Traefik
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [dutycloud-net]
+
+  # ---------- Message Broker ----------
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "15672:15672" # веб-інтерфейс RabbitMQ (guest / guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [dutycloud-net]
+
+  # ---------- Мікросервіси ----------
+  identity-service:
+    build: ./identity-service
+    environment:
+      NOTIFICATION_URL: http://notification-service:5002
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5001/api/identity/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.identity.rule=PathPrefix(`/api/identity`)
+      - traefik.http.routers.identity.entrypoints=web
+      - traefik.http.services.identity.loadbalancer.server.port=5001
+    networks: [dutycloud-net]
+
+  schedule-service:
+    build: ./schedule-service
+    environment:
+      IDENTITY_URL: http://identity-service:5001
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    volumes:
+      - schedule_data:/data   # спільна БД для всіх інстансів сервісу
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      identity-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5000/api/schedule/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.schedule.rule=PathPrefix(`/api/schedule`)
+      - traefik.http.routers.schedule.entrypoints=web
+      - traefik.http.services.schedule.loadbalancer.server.port=5000
+    networks: [dutycloud-net]
+
+  notification-service:
+    build: ./notification-service
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    volumes:
+      - notification_data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5002/api/notifications/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.notification.rule=PathPrefix(`/api/notifications`)
+      - traefik.http.routers.notification.entrypoints=web
+      - traefik.http.services.notification.loadbalancer.server.port=5002
+    networks: [dutycloud-net]
+
+networks:
+  dutycloud-net:
+    name: dutycloud-net
+
+volumes:
+  schedule_data:
+  notification_data:
